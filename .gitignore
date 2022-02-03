@@ -1,0 +1,4 @@
+*.pyc
+dataset/clintox/processed
+dataset/tox21/processed
+dataset/toxcast/processed
