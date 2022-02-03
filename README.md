@@ -25,7 +25,7 @@ Authors:
         - [ ] MPNN, Attentive FP 
     - [ ] ideas
         - [x] about modifying input graph, add super nodes for aromatic system (no improvement)
-        - [ ]
+        - [ ] -
 
 ### Requirements
 
@@ -47,7 +47,10 @@ python main.py
 ### Experiments
 - Idea 1: 1. Find all Aromatic atoms 2. Get aromatic systems 3. For each aromatic system add a super node that is connected with atoms in it by a directed edge. (For atoms connecting to substituents, add bidirectional edges) 4. During graph pooling, only consider about: all nodes (v1), all nodes except super nodes (v2), super nodes + heteroatoms + carbon pairs connected with multiple (double, triple) bonds (v3)
 
-|     | tox21(AUC) |
+Data splitting: random <br>
+Metric: AUC
+
+|     | tox21 |
 |  ----   | ----  |
 | GCN     | 84.46±0.37 |
 | GCN_v1  | 84.18±0.56 |
