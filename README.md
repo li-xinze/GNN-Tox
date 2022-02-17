@@ -18,14 +18,10 @@ Authors:
 ### To-Do list
 
 - [x] Framework
-- [x] Data splitting (random, scaffold)
-- [ ] Models
-	- [ ] baseline models 
-        - [x] GCN, GAT, GIN
-        - [ ] MPNN, Attentive FP 
-    - [ ] ideas
-        - [x] about modifying input graph, add super nodes for aromatic system (no improvement)
-        - [ ] -
+- [ ] Data augmentations
+    - [x] Node insertion (related to π-conjugated structure.) code: dataset/dataset_motif.py
+    - [ ] -
+
 
 ### Requirements
 
@@ -37,24 +33,29 @@ tqdm                      4.62.3
 tensorboardx              2.4
 ```
 
+### Dataset
+
+You can download the pre-training data and benchmarks used in the paper [here](https://drive.google.com/file/d/1aDtN6Qqddwwn2x612kWz9g0xQcuAtzDE/view?usp=sharing) and extract the zip file under `./data` folder. The data for pre-training can be found in `pubchem-10m-clean.txt`. All the other benchmarks for fine-tuning are saved in each folder.
+
 
 ### Run
 
+Pre-training
 ```
-python main.py 
+python molclr.py
+```
+
+Fine-tuning
+```
+python finetune.py
 ```
 
 ### Experiments
-- Idea 1: 1. Find all Aromatic atoms 2. Get aromatic systems 3. For each aromatic system add a super node that is connected with atoms in it by a directed edge. (For atoms connecting to substituents, add bidirectional edges) 4. During graph pooling, only consider about: all nodes (v1), all nodes except super nodes (v2), super nodes + heteroatoms + carbon pairs connected with multiple (double, triple) bonds (v3)
+Graph augmentation
+- Node insertion: 1. Find all Aromatic atoms 2. Get aromatic systems 3. Remove all edges in aromatic systems 4. For each aromatic system add a super node that is connected with atoms in it by a directed edge. (For atoms connecting to substituents, add bidirectional edges) 
+- Main code is in `dataset/dataset_motif.py`
 
 Data splitting: random <br>
 Metric: AUC
 
-|     | tox21 |
-|  ----   | ----  |
-| GCN     | 84.46±0.37 |
-| GCN_v1  | 84.18±0.56 |
-| GCN_v2  | 83.99±0.71 |
-| GCN_v3  | 82.65±0.54 |
-
-Remark: no improvement
+Remark: Finish by 20.02.2022
