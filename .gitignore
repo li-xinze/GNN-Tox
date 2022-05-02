@@ -2,4 +2,6 @@
 dataset/clintox/processed
 dataset/tox21/processed
 dataset/toxcast/processed
-data/pubchem-10m-clean.txt
+dataset/zinc_standard_agent/processed
+models
+experiments

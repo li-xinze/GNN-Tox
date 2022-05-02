@@ -1,356 +1,235 @@
+import argparse
+
+
+from torch_geometric.data import DataLoader
+
 import os
-import shutil
-import sys
-import yaml
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from datetime import datetime
-
 import torch
-from torch import nn
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from sklearn.metrics import roc_auc_score, mean_squared_error, mean_absolute_error
+import shutil
+import pandas as pd
+import torch.nn as nn
+import torch.optim as optim
 
-from dataset.dataset_test import MolTestDatasetWrapper
-
-
-apex_support = False
-try:
-    sys.path.append('./apex')
-    from apex import amp
-
-    apex_support = True
-except:
-    print("Please install apex for mixed precision training from: https://github.com/NVIDIA/apex")
-    apex_support = False
+from tqdm import tqdm
+import numpy as np
 
 
-def _save_config_file(model_checkpoints_folder):
-    if not os.path.exists(model_checkpoints_folder):
-        os.makedirs(model_checkpoints_folder)
-        shutil.copy('./config_finetune.yaml', os.path.join(model_checkpoints_folder, 'config_finetune.yaml'))
+from sklearn.metrics import roc_auc_score
+from dgssl.model import GNN_graphpred
+from dgssl.loader import MoleculeDataset
+from dgssl.splitters import scaffold_split
 
 
-class Normalizer(object):
-    """Normalize a Tensor and restore it later. """
-
-    def __init__(self, tensor):
-        """tensor is taken as a sample to calculate the mean and std"""
-        self.mean = torch.mean(tensor)
-        self.std = torch.std(tensor)
-
-    def norm(self, tensor):
-        return (tensor - self.mean) / self.std
-
-    def denorm(self, normed_tensor):
-        return normed_tensor * self.std + self.mean
-
-    def state_dict(self):
-        return {'mean': self.mean,
-                'std': self.std}
-
-    def load_state_dict(self, state_dict):
-        self.mean = state_dict['mean']
-        self.std = state_dict['std']
 
 
-class FineTune(object):
-    def __init__(self, dataset, config):
-        self.config = config
-        self.device = self._get_device()
+from tensorboardX import SummaryWriter
 
-        current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-        dir_name = current_time + '_' + config['task_name'] + '_' + config['dataset']['target']
-        log_dir = os.path.join('finetune', dir_name)
-        self.writer = SummaryWriter(log_dir=log_dir)
-        self.dataset = dataset
-        if config['dataset']['task'] == 'classification':
-            self.criterion = nn.CrossEntropyLoss()
-        elif config['dataset']['task'] == 'regression':
-            if self.config["task_name"] in ['qm7', 'qm8', 'qm9']:
-                self.criterion = nn.L1Loss()
-            else:
-                self.criterion = nn.MSELoss()
+criterion = nn.BCEWithLogitsLoss(reduction = "none")
 
-    def _get_device(self):
-        if torch.cuda.is_available() and self.config['gpu'] != 'cpu':
-            device = self.config['gpu']
-            torch.cuda.set_device(device)
-        else:
-            device = 'cpu'
-        print("Running on:", device)
+def train(args, model, device, loader, optimizer):
+    model.train()
 
-        return device
+    for step, batch in enumerate(tqdm(loader, desc="Iteration")):
+        batch = batch.to(device)
+        pred = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
+        y = batch.y.view(pred.shape).to(torch.float64)
 
-    def _step(self, model, data, n_iter):
-        # get the prediction
-        __, pred = model(data)  # [N,C]
+        #Whether y is non-null or not.
+        is_valid = y**2 > 0
+        #Loss matrix
+        loss_mat = criterion(pred.double(), (y+1)/2)
+        #loss matrix after removing null target
+        loss_mat = torch.where(is_valid, loss_mat, torch.zeros(loss_mat.shape).to(loss_mat.device).to(loss_mat.dtype))
+            
+        optimizer.zero_grad()
+        loss = torch.sum(loss_mat)/torch.sum(is_valid)
+        loss.backward()
 
-        if self.config['dataset']['task'] == 'classification':
-            loss = self.criterion(pred, data.y.flatten())
-        elif self.config['dataset']['task'] == 'regression':
-            if self.normalizer:
-                loss = self.criterion(pred, self.normalizer.norm(data.y))
-            else:
-                loss = self.criterion(pred, data.y)
+        optimizer.step()
 
-        return loss
 
-    def train(self):
-        train_loader, valid_loader, test_loader = self.dataset.get_data_loaders()
+def eval(args, model, device, loader):
+    model.eval()
+    y_true = []
+    y_scores = []
 
-        self.normalizer = None
-        if self.config["task_name"] in ['qm7', 'qm9']:
-            labels = []
-            for d, __ in train_loader:
-                labels.append(d.y)
-            labels = torch.cat(labels)
-            self.normalizer = Normalizer(labels)
-            print(self.normalizer.mean, self.normalizer.std, labels.shape)
+    for step, batch in enumerate(tqdm(loader, desc="Iteration")):
+        batch = batch.to(device)
 
-        if self.config['model_type'] == 'gin':
-            from models.ginet_finetune import GINet
-            model = GINet(self.config['dataset']['task'], **self.config["model"]).to(self.device)
-            model = self._load_pre_trained_weights(model)
-        elif self.config['model_type'] == 'gcn':
-            from models.gcn_finetune import GCN
-            model = GCN(self.config['dataset']['task'], **self.config["model"]).to(self.device)
-            model = self._load_pre_trained_weights(model)
-
-        layer_list = []
-        for name, param in model.named_parameters():
-            if 'pred_lin' in name:
-                print(name, param.requires_grad)
-                layer_list.append(name)
-
-        params = list(map(lambda x: x[1],list(filter(lambda kv: kv[0] in layer_list, model.named_parameters()))))
-        base_params = list(map(lambda x: x[1],list(filter(lambda kv: kv[0] not in layer_list, model.named_parameters()))))
-
-        optimizer = torch.optim.Adam(
-            [{'params': base_params, 'lr': self.config['init_base_lr']}, {'params': params}],
-            self.config['init_lr'], weight_decay=eval(self.config['weight_decay'])
-        )
-
-        if apex_support and self.config['fp16_precision']:
-            model, optimizer = amp.initialize(
-                model, optimizer, opt_level='O2', keep_batchnorm_fp32=True
-            )
-
-        model_checkpoints_folder = os.path.join(self.writer.log_dir, 'checkpoints')
-
-        # save config file
-        _save_config_file(model_checkpoints_folder)
-
-        n_iter = 0
-        valid_n_iter = 0
-        best_valid_loss = np.inf
-        best_valid_rgr = np.inf
-        best_valid_cls = 0
-
-        for epoch_counter in range(self.config['epochs']):
-            for bn, data in enumerate(tqdm(train_loader)):
-                optimizer.zero_grad()
-
-                data = data.to(self.device)
-                loss = self._step(model, data, n_iter)
-
-                # if n_iter % self.config['log_every_n_steps'] == 0:
-                #     self.writer.add_scalar('train_loss', loss, global_step=n_iter)
-                #     print(epoch_counter, bn, loss.item())
-
-                if apex_support and self.config['fp16_precision']:
-                    with amp.scale_loss(loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                else:
-                    loss.backward()
-
-                optimizer.step()
-                n_iter += 1
-
-            # validate the model if requested
-            if epoch_counter % self.config['eval_every_n_epochs'] == 0:
-                if self.config['dataset']['task'] == 'classification': 
-                    valid_loss, valid_cls = self._validate(model, valid_loader)
-                    if valid_cls > best_valid_cls:
-                        # save the model weights
-                        best_valid_cls = valid_cls
-                        torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'model.pth'))
-                elif self.config['dataset']['task'] == 'regression': 
-                    valid_loss, valid_rgr = self._validate(model, valid_loader)
-                    if valid_rgr < best_valid_rgr:
-                        # save the model weights
-                        best_valid_rgr = valid_rgr
-                        torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'model.pth'))
-
-                self.writer.add_scalar('validation_loss', valid_loss, global_step=valid_n_iter)
-                valid_n_iter += 1
-        
-        self._test(model, test_loader)
-
-    def _load_pre_trained_weights(self, model):
-        try:
-            checkpoints_folder = os.path.join('./ckpt', self.config['fine_tune_from'], 'checkpoints')
-            state_dict = torch.load(os.path.join(checkpoints_folder, 'model.pth'), map_location=self.device)
-            # model.load_state_dict(state_dict)
-            model.load_my_state_dict(state_dict)
-            print("Loaded pre-trained model with success.")
-        except FileNotFoundError:
-            print("Pre-trained weights not found. Training from scratch.")
-
-        return model
-
-    def _validate(self, model, valid_loader):
-        predictions = []
-        labels = []
         with torch.no_grad():
-            model.eval()
+            pred = model(batch.x, batch.edge_index, batch.edge_attr, batch.batch)
 
-            valid_loss = 0.0
-            num_data = 0
-            for bn, data in enumerate(valid_loader):
-                data = data.to(self.device)
+        y_true.append(batch.y.view(pred.shape))
+        y_scores.append(pred)
 
-                __, pred = model(data)
-                loss = self._step(model, data, bn)
+    y_true = torch.cat(y_true, dim = 0).cpu().numpy()
+    y_scores = torch.cat(y_scores, dim = 0).cpu().numpy()
 
-                valid_loss += loss.item() * data.y.size(0)
-                num_data += data.y.size(0)
+    roc_list = []
+    for i in range(y_true.shape[1]):
+        #AUC is only defined when there is at least one positive data.
+        if np.sum(y_true[:,i] == 1) > 0 and np.sum(y_true[:,i] == -1) > 0:
+            is_valid = y_true[:,i]**2 > 0
+            roc_list.append(roc_auc_score((y_true[is_valid,i] + 1)/2, y_scores[is_valid,i]))
 
-                if self.normalizer:
-                    pred = self.normalizer.denorm(pred)
+    if len(roc_list) < y_true.shape[1]:
+        print("Some target is missing!")
+        print("Missing ratio: %f" %(1 - float(len(roc_list))/y_true.shape[1]))
 
-                if self.device == 'cpu':
-                    predictions.extend(pred.detach().numpy())
-                    labels.extend(data.y.flatten().numpy())
-                else:
-                    predictions.extend(pred.cpu().detach().numpy())
-                    labels.extend(data.y.cpu().flatten().numpy())
-
-            valid_loss /= num_data
-        
-        model.train()
-
-        if self.config['dataset']['task'] == 'regression':
-            predictions = np.array(predictions)
-            labels = np.array(labels)
-            if self.config['task_name'] in ['qm7', 'qm8', 'qm9']:
-                mae = mean_absolute_error(labels, predictions)
-                print('Validation loss:', valid_loss, 'MAE:', mae)
-                return valid_loss, mae
-            else:
-                rmse = mean_squared_error(labels, predictions, squared=False)
-                print('Validation loss:', valid_loss, 'RMSE:', rmse)
-                return valid_loss, rmse
-
-        elif self.config['dataset']['task'] == 'classification': 
-            predictions = np.array(predictions)
-            labels = np.array(labels)
-            roc_auc = roc_auc_score(labels, predictions[:,1])
-            print('Validation loss:', valid_loss, 'ROC AUC:', roc_auc)
-            return valid_loss, roc_auc
-
-    def _test(self, model, test_loader):
-        model_path = os.path.join(self.writer.log_dir, 'checkpoints', 'model.pth')
-        state_dict = torch.load(model_path, map_location=self.device)
-        model.load_state_dict(state_dict)
-        print("Loaded trained model with success.")
-
-        # test steps
-        predictions = []
-        labels = []
-        with torch.no_grad():
-            model.eval()
-
-            test_loss = 0.0
-            num_data = 0
-            for bn, data in enumerate(test_loader):
-                data = data.to(self.device)
-
-                __, pred = model(data)
-                loss = self._step(model, data, bn)
-
-                test_loss += loss.item() * data.y.size(0)
-                num_data += data.y.size(0)
-
-                if self.normalizer:
-                    pred = self.normalizer.denorm(pred)
-
-                if self.device == 'cpu':
-                    predictions.extend(pred.detach().numpy())
-                    labels.extend(data.y.flatten().numpy())
-                else:
-                    predictions.extend(pred.cpu().detach().numpy())
-                    labels.extend(data.y.cpu().flatten().numpy())
-
-            test_loss /= num_data
-        
-        model.train()
-
-        if self.config['dataset']['task'] == 'regression':
-            predictions = np.array(predictions)
-            labels = np.array(labels)
-            if self.config['task_name'] in ['qm7', 'qm8', 'qm9']:
-                self.mae = mean_absolute_error(labels, predictions)
-                print('Test loss:', test_loss, 'Test MAE:', self.mae)
-            else:
-                self.rmse = mean_squared_error(labels, predictions, squared=False)
-                print('Test loss:', test_loss, 'Test RMSE:', self.rmse)
-
-        elif self.config['dataset']['task'] == 'classification': 
-            predictions = np.array(predictions)
-            labels = np.array(labels)
-            self.roc_auc = roc_auc_score(labels, predictions[:,1])
-            print('Test loss:', test_loss, 'Test ROC AUC:', self.roc_auc)
+    return sum(roc_list)/len(roc_list) #y_true.shape[1]
 
 
-def main(config):
-    dataset = MolTestDatasetWrapper(config['batch_size'], **config['dataset'])
 
-    fine_tune = FineTune(dataset, config)
-    fine_tune.train()
+def main():
+    # Training settings
+    parser = argparse.ArgumentParser(description='PyTorch implementation of pre-training of graph neural networks')
+    parser.add_argument('--device', type=int, default=7,
+                        help='which gpu to use if any (default: 0)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='input batch size for training (default: 32)')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='number of epochs to train (default: 100)')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='learning rate (default: 0.001)')
+    parser.add_argument('--lr_scale', type=float, default=1,
+                        help='relative learning rate for the feature extraction layer (default: 1)')
+    parser.add_argument('--decay', type=float, default=0,
+                        help='weight decay (default: 0)')
+    parser.add_argument('--num_layer', type=int, default=5,
+                        help='number of GNN message passing layers (default: 5).')
+    parser.add_argument('--emb_dim', type=int, default=300,
+                        help='embedding dimensions (default: 300)')
+    parser.add_argument('--dropout_ratio', type=float, default=0.5,
+                        help='dropout ratio (default: 0.5)')
+    parser.add_argument('--graph_pooling', type=str, default="mean",
+                        help='graph level pooling (sum, mean, max, set2set, attention)')
+    parser.add_argument('--JK', type=str, default="last",
+                        help='how the node features across layers are combined. last, sum, max or concat')
+    parser.add_argument('--gnn_type', type=str, default="gin")
+    parser.add_argument('--dataset', type=str, default = 'tox21', help='root directory of dataset. For now, only classification.')
+    parser.add_argument('--input_model_file', type=str, default = '', help='filename to read the model (if there is any)')
+    parser.add_argument('--filename', type=str, default = '', help='output filename')
+    parser.add_argument('--seed', type=int, default=42, help = "Seed for splitting the dataset.")
+    parser.add_argument('--runseed', type=int, default=0, help = "Seed for minibatch selection, random initialization.")
+    parser.add_argument('--split', type = str, default="scaffold", help = "random or scaffold or random_scaffold")
+    parser.add_argument('--eval_train', type=int, default = 0, help='evaluating training or not')
+    parser.add_argument('--num_workers', type=int, default = 4, help='number of workers for dataset loading')
+    args = parser.parse_args()
+
+
+    torch.manual_seed(args.runseed)
+    np.random.seed(args.runseed)
+    device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.runseed)
+
+    #Bunch of classification tasks
+    if args.dataset == "tox21":
+        num_tasks = 12
+    elif args.dataset == "hiv":
+        num_tasks = 1
+    elif args.dataset == "pcba":
+        num_tasks = 128
+    elif args.dataset == "muv":
+        num_tasks = 17
+    elif args.dataset == "bace":
+        num_tasks = 1
+    elif args.dataset == "bbbp":
+        num_tasks = 1
+    elif args.dataset == "toxcast":
+        num_tasks = 617
+    elif args.dataset == "sider":
+        num_tasks = 27
+    elif args.dataset == "clintox":
+        num_tasks = 2
+    else:
+        raise ValueError("Invalid dataset name.")
+
+    #set up dataset
+    dataset = MoleculeDataset("dataset/" + args.dataset, dataset=args.dataset)
+
+    print(dataset)
     
-    if config['dataset']['task'] == 'classification':
-        return fine_tune.roc_auc
-    if config['dataset']['task'] == 'regression':
-        if config['task_name'] in ['qm7', 'qm8', 'qm9']:
-            return fine_tune.mae
-        else:
-            return fine_tune.rmse
+    if args.split == "scaffold":
+        smiles_list = pd.read_csv('dataset/' + args.dataset + '/processed/smiles.csv', header=None)[0].tolist()
+        train_dataset, valid_dataset, test_dataset = scaffold_split(dataset, smiles_list, null_value=0, frac_train=0.8,frac_valid=0.1, frac_test=0.1)
+        print("scaffold")
+    elif args.split == "random":
+        train_dataset, valid_dataset, test_dataset = random_split(dataset, null_value=0, frac_train=0.8,frac_valid=0.1, frac_test=0.1, seed = args.seed)
+        print("random")
+    elif args.split == "random_scaffold":
+        smiles_list = pd.read_csv('dataset/' + args.dataset + '/processed/smiles.csv', header=None)[0].tolist()
+        train_dataset, valid_dataset, test_dataset = random_scaffold_split(dataset, smiles_list, null_value=0, frac_train=0.8,frac_valid=0.1, frac_test=0.1, seed = args.seed)
+        print("random scaffold")
+    else:
+        raise ValueError("Invalid split option.")
 
+    print(train_dataset[0])
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers = args.num_workers)
+    val_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers = args.num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers = args.num_workers)
+
+    #set up model
+    model = GNN_graphpred(args.num_layer, args.emb_dim, num_tasks, JK = args.JK, drop_ratio = args.dropout_ratio, graph_pooling = args.graph_pooling, gnn_type = args.gnn_type)
+    if not args.input_model_file == "":
+        print('load ', args.input_model_file)
+        model.from_pretrained(args.input_model_file)
+    
+    model.to(device)
+
+    #set up optimizer
+    #different learning rate for different part of GNN
+    model_param_group = []
+    model_param_group.append({"params": model.gnn.parameters()})
+    if args.graph_pooling == "attention":
+        model_param_group.append({"params": model.pool.parameters(), "lr":args.lr*args.lr_scale})
+    model_param_group.append({"params": model.graph_pred_linear.parameters(), "lr":args.lr*args.lr_scale})
+    optimizer = optim.Adam(model_param_group, lr=args.lr, weight_decay=args.decay)
+    print(optimizer)
+
+    train_acc_list = []
+    val_acc_list = []
+    test_acc_list = []
+
+
+    if not args.filename == "":
+        fname = 'experiments/runs_' + args.filename + '/finetune_cls_runseed' + str(args.runseed) + '/' + args.dataset
+        #delete the directory if there exists one
+        if os.path.exists(fname):
+            shutil.rmtree(fname)
+            print("removed the existing file.")
+        writer = SummaryWriter(fname)
+
+    for epoch in range(1, args.epochs+1):
+        print("====epoch " + str(epoch))
+        
+        train(args, model, device, train_loader, optimizer)
+
+        print("====Evaluation")
+        if args.eval_train:
+            train_acc = eval(args, model, device, train_loader)
+        else:
+            print("omit the training accuracy computation")
+            train_acc = 0
+        val_acc = eval(args, model, device, val_loader)
+        test_acc = eval(args, model, device, test_loader)
+
+        print("train: %f val: %f test: %f" %(train_acc, val_acc, test_acc))
+
+        val_acc_list.append(val_acc)
+        test_acc_list.append(test_acc)
+        train_acc_list.append(train_acc)
+
+        if not args.filename == "":
+            writer.add_scalar('data/train auc', train_acc, epoch)
+            writer.add_scalar('data/val auc', val_acc, epoch)
+            writer.add_scalar('data/test auc', test_acc, epoch)
+
+        print("")
+
+    if not args.filename == "":
+        writer.close()
 
 if __name__ == "__main__":
-    config = yaml.load(open("configs/config_finetune.yaml", "r"), Loader=yaml.FullLoader)
-    
-    if config['task_name'] == 'Tox21':
-        config['dataset']['task'] = 'classification'
-        config['dataset']['data_path'] = 'data/tox21/tox21.csv'
-        target_list = [
-            "NR-AR", "NR-AR-LBD", "NR-AhR", "NR-Aromatase", "NR-ER", "NR-ER-LBD", 
-            "NR-PPAR-gamma", "SR-ARE", "SR-ATAD5", "SR-HSE", "SR-MMP", "SR-p53"
-        ]
-
-    elif config['task_name'] == 'ClinTox':
-        config['dataset']['task'] = 'classification'
-        config['dataset']['data_path'] = 'data/clintox/clintox.csv'
-        target_list = ['CT_TOX', 'FDA_APPROVED']
-
-    else:
-        raise ValueError('Undefined downstream task!')
-
-    print(config)
-
-    results_list = []
-    for target in target_list:
-        config['dataset']['target'] = target
-        result = main(config)
-        results_list.append([target, result])
-
-    os.makedirs('experiments', exist_ok=True)
-    df = pd.DataFrame(results_list)
-    df.to_csv(
-        'experiments/{}_{}_finetune32_scaffold.csv'.format(config['fine_tune_from'], config['task_name']), 
-        mode='a', index=False, header=False
-    )
+    main()
